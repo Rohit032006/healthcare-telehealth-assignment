@@ -1,0 +1,56 @@
+name: healthcare
+description: "A new Flutter project."
+publish_to: "none"
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  get: ^4.7.3
+  permission_handler: ^12.0.3
+  get_storage: ^2.1.1
+  flutter_dotenv: ^6.0.1
+  logger: ^2.7.0
+  intl: ^0.20.3
+  get_it: ^9.2.1
+  go_router: ^17.3.0
+  dio: ^5.10.0
+  dropdown_button2: ^3.1.0
+  lottie: ^3.5.1
+  flutter_svg: ^2.3.0
+  firebase_core: ^4.11.0
+  cloud_firestore: ^6.6.0
+  flutter_webrtc: ^1.5.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/
+    - assets/images/
+    - assets/images/background_images/
+    - assets/env/
+    - assets/sounds/visitor_sound.mp3
+  # example:
+  fonts:
+    - family: Figtree
+      fonts:
+        - asset: fonts/Figtree-Regular.ttf
+        - asset: fonts/Figtree-Italic.ttf
+          style: italic
+        - asset: fonts/Figtree-SemiBold.ttf
+          weight: 500
+        - asset: fonts/Figtree-Bold.ttf
+          weight: 600

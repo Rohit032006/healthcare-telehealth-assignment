@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "368843270200",
+    "project_id": "helathcare-2b4b9",
+    "storage_bucket": "helathcare-2b4b9.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:368843270200:android:72441bfbcb08e271d89ecd",
+        "android_client_info": {
+          "package_name": "com.helathcare"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD4gOMdzIYnysHMqA_F9ogLljOnKv_hkFQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

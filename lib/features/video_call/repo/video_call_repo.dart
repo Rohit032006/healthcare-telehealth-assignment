@@ -11,7 +11,11 @@ abstract class IVideoCallRepo {
 
   Future<void> sendOffer(String appointmentId, RTCSessionDescription offer);
   Future<void> sendAnswer(String appointmentId, RTCSessionDescription answer);
-  Future<Map<String, dynamic>?> getOffer(String appointmentId);
+
+  /// Waits (listens) until the caller's offer appears in the room, rather
+  /// than checking once — the caller may still be creating its offer
+  /// (an async WebRTC call) when the callee reaches this point.
+  Future<Map<String, dynamic>> waitForOffer(String appointmentId);
 
   Stream<DocumentSnapshot<Map<String, dynamic>>> roomStream(String appointmentId);
 
@@ -41,10 +45,16 @@ class VideoCallRepo implements IVideoCallRepo {
       final snap = await tx.get(ref);
       final data = snap.data();
 
-      if (!snap.exists || data?['offer'] == null) {
+      // Caller role is claimed via a dedicated flag set instantly inside this
+      // transaction — NOT by checking whether the `offer` field is already
+      // written, since creating an SDP offer is a slower async WebRTC call
+      // that happens after this transaction resolves. Keying off `offer`
+      // let both instances see it as absent and both become caller when they
+      // tapped "Start Video Call" at close to the same time.
+      if (!snap.exists || data?['callerClaimedAt'] == null) {
         tx.set(ref, {
           'status': 'waiting',
-          'createdAt': FieldValue.serverTimestamp(),
+          'callerClaimedAt': FieldValue.serverTimestamp(),
         });
         return CallRole.caller;
       }
@@ -62,7 +72,7 @@ class VideoCallRepo implements IVideoCallRepo {
       wasStaleRoom = true;
       tx.set(ref, {
         'status': 'waiting',
-        'createdAt': FieldValue.serverTimestamp(),
+        'callerClaimedAt': FieldValue.serverTimestamp(),
       });
       return CallRole.caller;
     });
@@ -104,10 +114,13 @@ class VideoCallRepo implements IVideoCallRepo {
   }
 
   @override
-  Future<Map<String, dynamic>?> getOffer(String appointmentId) async {
-    final snap = await _calls.doc(appointmentId).get();
-    final offer = snap.data()?['offer'];
-    return offer == null ? null : Map<String, dynamic>.from(offer as Map);
+  Future<Map<String, dynamic>> waitForOffer(String appointmentId) async {
+    final snap = await _calls
+        .doc(appointmentId)
+        .snapshots()
+        .firstWhere((s) => s.data()?['offer'] != null)
+        .timeout(const Duration(seconds: 30));
+    return Map<String, dynamic>.from(snap.data()!['offer'] as Map);
   }
 
   @override

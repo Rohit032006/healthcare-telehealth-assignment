@@ -151,5 +151,5 @@ lib/
     widgets/          shared themed buttons/text fields/bottom sheets (reused as-is)
     constants/        colors, text styles, validators, mock data
   environment_config/ env loading + app bootstrap (Firebase init added here)
-  firebase_options.dart  placeholder — regenerate with `flutterfire configure`
+  firebase_options.dart  Firebase config for this submission's project (Android + Web)
 ```

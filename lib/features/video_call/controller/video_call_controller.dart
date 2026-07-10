@@ -146,12 +146,7 @@ class VideoCallController extends GetxController {
       _videoCallRepo.addAnswerCandidate(appointmentId, candidate);
     };
 
-    final offer = await _videoCallRepo.getOffer(appointmentId);
-    if (offer == null) {
-      ToastServices.error('Connection Error', 'No active call found to join.');
-      isConnecting.value = false;
-      return;
-    }
+    final offer = await _videoCallRepo.waitForOffer(appointmentId);
 
     await _peerConnection!.setRemoteDescription(
       RTCSessionDescription(offer['sdp'], offer['type']),

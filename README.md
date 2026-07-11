@@ -136,9 +136,10 @@ too, instead of leaving them stuck on a frozen call screen.
 
 ## 7. Known limitations / what could be improved
 
-- **No TURN server** — only public STUN is configured, so calls may fail across
-  restrictive/symmetric NATs or corporate firewalls. A production build would add a TURN
-  server (e.g. via a managed provider) as a fallback relay.
+- **Free public TURN server** — a STUN + TURN combo (OpenRelay) is configured so calls work
+  across mobile data / different networks, not just same-WiFi. OpenRelay is a shared free
+  service though, not meant for production load — a real deployment should use a paid/
+  managed TURN provider instead.
 - **No incoming-call UI / push notifications** — both parties must manually tap "Start
   Video Call" at roughly the same time; there's no ringing/accept-reject screen.
 - **Firestore test-mode rules** — for a real deployment, Firestore security rules should

@@ -68,30 +68,44 @@ Password: Doctor@123
 ## 4. WebRTC / signaling architecture
 
 `flutter_webrtc` handles the actual `RTCPeerConnection`, camera/mic capture, and media
-tracks. Firestore is used only as a signaling channel — one document per appointment,
-with the appointment ID doubling as the room code (this assignment has exactly one mocked
-appointment, so no separate "join by code" UI was needed):
+tracks. Firestore is used only as a signaling channel — a lightweight pointer document per
+appointment, plus one **never-reused subdocument per call attempt**:
 
 ```
-calls/{appointmentId}
-  status: waiting | active | ended
+calls/{appointmentId}                       // pointer — tiny, just says who's waiting
+  activeCallId: string
+  status: waiting | answered
+
+calls/{appointmentId}/sessions/{callId}     // one per call attempt, never reused
+  status: active | ended
   offer:  { sdp, type }        // written by the caller
   answer: { sdp, type }        // written by the callee
   offerCandidates/{autoId}     // caller's ICE candidates
   answerCandidates/{autoId}    // callee's ICE candidates
 ```
 
-**Caller/callee resolution** happens automatically via a Firestore transaction
-(`VideoCallRepo.joinOrCreateRoom`): whichever instance taps "Start Video Call" first
-creates the room and becomes the caller; the second becomes the callee. A stale room from
-a previous test call is detected (both `offer` and `answer` already present) and reset.
+Each tap of "Start Video Call" gets a brand-new `sessions/{callId}` document — earlier
+iterations reused a single shared document across retries (resetting/deleting it between
+calls), which kept hitting races where a fresh retry would misread leftover state from the
+previous, already-finished call. A never-reused-per-attempt document makes that entire bug
+class structurally impossible: there is nothing stale to ever misread.
 
-**Sequence**: caller creates an `RTCPeerConnection` (STUN only —
-`stun.l.google.com:19302`) → `createOffer` → writes `offer` → listens for `answer` →
-`setRemoteDescription`. Callee reads `offer` → `setRemoteDescription` → `createAnswer` →
-writes `answer`. Both sides stream their own ICE candidates into their subcollection and
-listen to the other's. Ending the call marks the room `ended`, closes the peer connection
-and both `MediaStream`s, and cancels the Firestore listeners.
+**Caller/callee resolution** happens atomically via a Firestore transaction on the pointer
+doc (`VideoCallRepo.joinOrCreateRoom`): if the pointer says someone is `waiting`, this
+instance joins that `callId` as callee (and immediately flips the pointer to `answered` so
+a third instance can't also claim it); otherwise it claims a fresh `callId` and becomes the
+caller — this covers a brand-new appointment, a call that already finished, or one that was
+abandoned, all identically.
+
+**Sequence**: caller creates an `RTCPeerConnection` (STUN + a public TURN relay —
+[OpenRelay](https://www.metered.ca/tools/openrelay/), free/for demo use; STUN alone often
+can't establish a direct route across mobile data or restrictive NATs) → `createOffer` →
+writes `offer` → listens for `answer` → `setRemoteDescription`. Callee waits for `offer` →
+`setRemoteDescription` → `createAnswer` → writes `answer`. Both sides stream their own ICE
+candidates into their subcollection and listen to the other's. Ending the call marks that
+session `ended`; **both** sides listen for this (not just the caller) so either party
+pressing End Call cleanly closes the peer connection and navigates the other party away
+too, instead of leaving them stuck on a frozen call screen.
 
 ## 5. How to test video calling
 

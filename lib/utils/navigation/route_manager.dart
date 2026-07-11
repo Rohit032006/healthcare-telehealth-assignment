@@ -54,6 +54,14 @@ class AppRouter {
       GoRoute(
         path: AppRoutes.videoCall,
         builder: (context, state) {
+          // This app navigates with go_router, not GetX's own router, so
+          // GetX never sees the "leave the video call screen" event and
+          // won't auto-dispose the controller — a plain lazyPut would keep
+          // reusing the same (already-used, already-closed) controller on a
+          // second call, leaving stale internal state (e.g. the
+          // remoteDescription-set flag) that silently blocks reconnecting.
+          // Force-deleting first guarantees a fresh controller every time.
+          Get.delete<VideoCallController>(force: true);
           Get.lazyPut<VideoCallController>(() => VideoCallController());
           final appointmentId = Get.find<AppointmentController>().appointment.value!.id;
           return VideoCallScreen(appointmentId: appointmentId);

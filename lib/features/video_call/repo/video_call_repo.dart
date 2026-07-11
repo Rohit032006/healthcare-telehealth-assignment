@@ -3,29 +3,44 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 enum CallRole { caller, callee }
 
+class RoomJoinResult {
+  final CallRole role;
+  final String callId;
+
+  const RoomJoinResult({required this.role, required this.callId});
+}
+
 abstract class IVideoCallRepo {
   /// Atomically decides whether this app instance is the caller or callee
-  /// for [appointmentId]'s call room, so two independent instances tapping
-  /// "Start Video Call" at roughly the same time never collide.
-  Future<CallRole> joinOrCreateRoom(String appointmentId);
+  /// for [appointmentId], and hands back a [RoomJoinResult.callId] that
+  /// uniquely identifies *this* call attempt.
+  ///
+  /// Every attempt gets its own never-reused Firestore subdocument rather
+  /// than repeatedly resetting/deleting one shared document — earlier
+  /// designs that reused a single doc across retries kept hitting races
+  /// where a fresh call attempt would misread leftover fields from the
+  /// previous (already finished) call. A brand-new document per attempt
+  /// makes that category of bug structurally impossible: there is never
+  /// anything stale to misread.
+  Future<RoomJoinResult> joinOrCreateRoom(String appointmentId);
 
-  Future<void> sendOffer(String appointmentId, RTCSessionDescription offer);
-  Future<void> sendAnswer(String appointmentId, RTCSessionDescription answer);
+  Future<void> sendOffer(String appointmentId, String callId, RTCSessionDescription offer);
+  Future<void> sendAnswer(String appointmentId, String callId, RTCSessionDescription answer);
 
-  /// Waits (listens) until the caller's offer appears in the room, rather
-  /// than checking once — the caller may still be creating its offer
-  /// (an async WebRTC call) when the callee reaches this point.
-  Future<Map<String, dynamic>> waitForOffer(String appointmentId);
+  /// Waits (listens) until the caller's offer appears, rather than checking
+  /// once — the caller may still be creating its offer (an async WebRTC
+  /// call) when the callee reaches this point.
+  Future<Map<String, dynamic>> waitForOffer(String appointmentId, String callId);
 
-  Stream<DocumentSnapshot<Map<String, dynamic>>> roomStream(String appointmentId);
+  Stream<DocumentSnapshot<Map<String, dynamic>>> sessionStream(String appointmentId, String callId);
 
-  Future<void> addOfferCandidate(String appointmentId, RTCIceCandidate candidate);
-  Future<void> addAnswerCandidate(String appointmentId, RTCIceCandidate candidate);
+  Future<void> addOfferCandidate(String appointmentId, String callId, RTCIceCandidate candidate);
+  Future<void> addAnswerCandidate(String appointmentId, String callId, RTCIceCandidate candidate);
 
-  Stream<QuerySnapshot<Map<String, dynamic>>> offerCandidatesStream(String appointmentId);
-  Stream<QuerySnapshot<Map<String, dynamic>>> answerCandidatesStream(String appointmentId);
+  Stream<QuerySnapshot<Map<String, dynamic>>> offerCandidatesStream(String appointmentId, String callId);
+  Stream<QuerySnapshot<Map<String, dynamic>>> answerCandidatesStream(String appointmentId, String callId);
 
-  Future<void> endCall(String appointmentId);
+  Future<void> endCall(String appointmentId, String callId);
 }
 
 /// Firestore is used purely as a signaling channel to exchange the SDP
@@ -34,89 +49,60 @@ abstract class IVideoCallRepo {
 class VideoCallRepo implements IVideoCallRepo {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
-  CollectionReference<Map<String, dynamic>> get _calls => _firestore.collection('calls');
+  DocumentReference<Map<String, dynamic>> _pointer(String appointmentId) =>
+      _firestore.collection('calls').doc(appointmentId);
+
+  DocumentReference<Map<String, dynamic>> _session(String appointmentId, String callId) =>
+      _pointer(appointmentId).collection('sessions').doc(callId);
 
   @override
-  Future<CallRole> joinOrCreateRoom(String appointmentId) async {
-    final ref = _calls.doc(appointmentId);
-    bool wasStaleRoom = false;
+  Future<RoomJoinResult> joinOrCreateRoom(String appointmentId) async {
+    final pointerRef = _pointer(appointmentId);
 
-    final role = await _firestore.runTransaction<CallRole>((tx) async {
-      final snap = await tx.get(ref);
+    return _firestore.runTransaction<RoomJoinResult>((tx) async {
+      final snap = await tx.get(pointerRef);
       final data = snap.data();
+      final activeCallId = data?['activeCallId'] as String?;
+      final status = data?['status'];
 
-      // Caller role is claimed via a dedicated flag set instantly inside this
-      // transaction — NOT by checking whether the `offer` field is already
-      // written, since creating an SDP offer is a slower async WebRTC call
-      // that happens after this transaction resolves. Keying off `offer`
-      // let both instances see it as absent and both become caller when they
-      // tapped "Start Video Call" at close to the same time.
-      if (!snap.exists || data?['callerClaimedAt'] == null) {
-        tx.set(ref, {
-          'status': 'waiting',
-          'callerClaimedAt': FieldValue.serverTimestamp(),
-        });
-        return CallRole.caller;
+      if (activeCallId != null && status == 'waiting') {
+        // Someone is actively waiting for a callee right now — join them,
+        // and flip status immediately so a third instance can't also claim
+        // callee for the same session.
+        tx.set(pointerRef, {'status': 'answered'}, SetOptions(merge: true));
+        return RoomJoinResult(role: CallRole.callee, callId: activeCallId);
       }
 
-      if (data?['answer'] == null) {
-        return CallRole.callee;
-      }
-
-      // Both offer & answer already present — a stale room from a previous
-      // test call. A plain (non-merge) set() below fully overwrites the
-      // document, so offer/answer are already dropped just by omitting them
-      // — FieldValue.delete() must not be used here, it's only valid with
-      // update() or a merge set(), and throws [cloud_firestore/unknown] null
-      // otherwise.
-      wasStaleRoom = true;
-      tx.set(ref, {
+      // No one is waiting (a brand-new appointment, a call that already
+      // completed, or one that was abandoned) — claim a fresh session.
+      final newCallId = pointerRef.collection('sessions').doc().id;
+      tx.set(pointerRef, {
+        'activeCallId': newCallId,
         'status': 'waiting',
-        'callerClaimedAt': FieldValue.serverTimestamp(),
       });
-      return CallRole.caller;
+      return RoomJoinResult(role: CallRole.caller, callId: newCallId);
     });
-
-    // Old ICE candidates left over from the previous call would otherwise be
-    // replayed into the new peer connection (a fresh listener sees every
-    // pre-existing subcollection doc as "added").
-    if (wasStaleRoom) {
-      await _clearCandidates(ref, 'offerCandidates');
-      await _clearCandidates(ref, 'answerCandidates');
-    }
-
-    return role;
-  }
-
-  Future<void> _clearCandidates(DocumentReference ref, String subcollection) async {
-    final docs = await ref.collection(subcollection).get();
-    final batch = _firestore.batch();
-    for (final doc in docs.docs) {
-      batch.delete(doc.reference);
-    }
-    await batch.commit();
   }
 
   @override
-  Future<void> sendOffer(String appointmentId, RTCSessionDescription offer) {
-    return _calls.doc(appointmentId).set({
+  Future<void> sendOffer(String appointmentId, String callId, RTCSessionDescription offer) {
+    return _session(appointmentId, callId).set({
       'status': 'active',
       'offer': {'sdp': offer.sdp, 'type': offer.type},
     }, SetOptions(merge: true));
   }
 
   @override
-  Future<void> sendAnswer(String appointmentId, RTCSessionDescription answer) {
-    return _calls.doc(appointmentId).set({
+  Future<void> sendAnswer(String appointmentId, String callId, RTCSessionDescription answer) {
+    return _session(appointmentId, callId).set({
       'status': 'active',
       'answer': {'sdp': answer.sdp, 'type': answer.type},
     }, SetOptions(merge: true));
   }
 
   @override
-  Future<Map<String, dynamic>> waitForOffer(String appointmentId) async {
-    final snap = await _calls
-        .doc(appointmentId)
+  Future<Map<String, dynamic>> waitForOffer(String appointmentId, String callId) async {
+    final snap = await _session(appointmentId, callId)
         .snapshots()
         .firstWhere((s) => s.data()?['offer'] != null)
         .timeout(const Duration(seconds: 30));
@@ -124,32 +110,32 @@ class VideoCallRepo implements IVideoCallRepo {
   }
 
   @override
-  Stream<DocumentSnapshot<Map<String, dynamic>>> roomStream(String appointmentId) {
-    return _calls.doc(appointmentId).snapshots();
+  Stream<DocumentSnapshot<Map<String, dynamic>>> sessionStream(String appointmentId, String callId) {
+    return _session(appointmentId, callId).snapshots();
   }
 
   @override
-  Future<void> addOfferCandidate(String appointmentId, RTCIceCandidate candidate) {
-    return _calls.doc(appointmentId).collection('offerCandidates').add(candidate.toMap());
+  Future<void> addOfferCandidate(String appointmentId, String callId, RTCIceCandidate candidate) {
+    return _session(appointmentId, callId).collection('offerCandidates').add(candidate.toMap());
   }
 
   @override
-  Future<void> addAnswerCandidate(String appointmentId, RTCIceCandidate candidate) {
-    return _calls.doc(appointmentId).collection('answerCandidates').add(candidate.toMap());
+  Future<void> addAnswerCandidate(String appointmentId, String callId, RTCIceCandidate candidate) {
+    return _session(appointmentId, callId).collection('answerCandidates').add(candidate.toMap());
   }
 
   @override
-  Stream<QuerySnapshot<Map<String, dynamic>>> offerCandidatesStream(String appointmentId) {
-    return _calls.doc(appointmentId).collection('offerCandidates').snapshots();
+  Stream<QuerySnapshot<Map<String, dynamic>>> offerCandidatesStream(String appointmentId, String callId) {
+    return _session(appointmentId, callId).collection('offerCandidates').snapshots();
   }
 
   @override
-  Stream<QuerySnapshot<Map<String, dynamic>>> answerCandidatesStream(String appointmentId) {
-    return _calls.doc(appointmentId).collection('answerCandidates').snapshots();
+  Stream<QuerySnapshot<Map<String, dynamic>>> answerCandidatesStream(String appointmentId, String callId) {
+    return _session(appointmentId, callId).collection('answerCandidates').snapshots();
   }
 
   @override
-  Future<void> endCall(String appointmentId) {
-    return _calls.doc(appointmentId).set({'status': 'ended'}, SetOptions(merge: true));
+  Future<void> endCall(String appointmentId, String callId) {
+    return _session(appointmentId, callId).set({'status': 'ended'}, SetOptions(merge: true));
   }
 }

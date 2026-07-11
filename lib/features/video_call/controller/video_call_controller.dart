@@ -7,6 +7,7 @@ import 'package:go_router/go_router.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import '../../../utils/constants/local_storage_key_strings.dart';
 import '../../../utils/dependency_locator.dart';
 import '../../../utils/navigation/app_routes.dart';
 import '../../../utils/networks/toast_services/toast_services.dart';
@@ -24,6 +25,12 @@ class VideoCallController extends GetxController {
 
   final IVideoCallRepo _videoCallRepo = getIt();
 
+  // STUN alone only works when both peers can find a direct P2P route; on
+  // mobile data / restrictive NATs that fails silently (signaling succeeds,
+  // onTrack fires, but no media ever arrives — a black remote video). TURN
+  // relays media when a direct route isn't possible. OpenRelay's free public
+  // TURN server is used here since this is a demo/test app, not production
+  // traffic — see README "Known limitations" for the production alternative.
   static const Map<String, dynamic> _rtcConfig = {
     'iceServers': [
       {
@@ -32,15 +39,32 @@ class VideoCallController extends GetxController {
           'stun:stun1.l.google.com:19302',
         ]
       },
+      {
+        'urls': 'turn:openrelay.metered.ca:80',
+        'username': 'openrelayproject',
+        'credential': 'openrelayproject',
+      },
+      {
+        'urls': 'turn:openrelay.metered.ca:443',
+        'username': 'openrelayproject',
+        'credential': 'openrelayproject',
+      },
+      {
+        'urls': 'turn:openrelay.metered.ca:443?transport=tcp',
+        'username': 'openrelayproject',
+        'credential': 'openrelayproject',
+      },
     ],
   };
 
   RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
   String? _appointmentId;
+  String? _callId;
   bool _remoteDescriptionSet = false;
+  bool _callEndHandled = false;
 
-  StreamSubscription? _roomSubscription;
+  StreamSubscription? _sessionSubscription;
   StreamSubscription? _offerCandidatesSubscription;
   StreamSubscription? _answerCandidatesSubscription;
 
@@ -84,17 +108,51 @@ class VideoCallController extends GetxController {
     _peerConnection!.onConnectionState = (state) {
       if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
           state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
-        ToastServices.warning('Call Disconnected', 'The connection was lost.');
-        callStatusText.value = 'Disconnected';
+        // Fallback for when the other side vanished without writing
+        // status:'ended' (e.g. app killed, network dropped entirely) — the
+        // Firestore session-status listener below is the fast/normal path.
+        _handleCallEndedRemotely('The connection was lost.');
       }
     };
 
     try {
-      final role = await _videoCallRepo.joinOrCreateRoom(appointmentId);
-      if (role == CallRole.caller) {
-        await _startAsCaller(appointmentId);
+      final joinResult = await _videoCallRepo.joinOrCreateRoom(appointmentId);
+      final callId = joinResult.callId;
+      _callId = callId;
+
+      // Every call attempt gets its own never-reused session document (see
+      // VideoCallRepo docs), so this listener can never see leftover state
+      // from a *previous* finished call — eliminating the whole class of
+      // "brand-new call immediately looks ended" races earlier designs hit
+      // when a single shared document was reset/reused across retries.
+      //
+      // Shared by both roles: the callee previously never listened for the
+      // session ending at all, so it had no way of knowing when the caller
+      // pressed End Call — it just sat frozen on the call screen.
+      _sessionSubscription =
+          _videoCallRepo.sessionStream(appointmentId, callId).listen((snapshot) async {
+        final data = snapshot.data();
+        if (data == null) return;
+
+        if (data['status'] == 'ended') {
+          _handleCallEndedRemotely('The other participant ended the call.');
+          return;
+        }
+
+        // Caller-only: pick up the answer once the callee writes it.
+        final answer = data['answer'];
+        if (answer != null && !_remoteDescriptionSet && _peerConnection != null) {
+          _remoteDescriptionSet = true;
+          await _peerConnection!.setRemoteDescription(
+            RTCSessionDescription(answer['sdp'], answer['type']),
+          );
+        }
+      });
+
+      if (joinResult.role == CallRole.caller) {
+        await _startAsCaller(appointmentId, callId);
       } else {
-        await _joinAsCallee(appointmentId);
+        await _joinAsCallee(appointmentId, callId);
       }
     } catch (e) {
       isConnecting.value = false;
@@ -102,30 +160,19 @@ class VideoCallController extends GetxController {
     }
   }
 
-  Future<void> _startAsCaller(String appointmentId) async {
+  Future<void> _startAsCaller(String appointmentId, String callId) async {
     callStatusText.value = 'Waiting for the other participant...';
 
     _peerConnection!.onIceCandidate = (candidate) {
-      _videoCallRepo.addOfferCandidate(appointmentId, candidate);
+      _videoCallRepo.addOfferCandidate(appointmentId, callId, candidate);
     };
 
     final offer = await _peerConnection!.createOffer();
     await _peerConnection!.setLocalDescription(offer);
-    await _videoCallRepo.sendOffer(appointmentId, offer);
-
-    _roomSubscription = _videoCallRepo.roomStream(appointmentId).listen((snapshot) async {
-      final data = snapshot.data();
-      final answer = data?['answer'];
-      if (answer != null && !_remoteDescriptionSet) {
-        _remoteDescriptionSet = true;
-        await _peerConnection!.setRemoteDescription(
-          RTCSessionDescription(answer['sdp'], answer['type']),
-        );
-      }
-    });
+    await _videoCallRepo.sendOffer(appointmentId, callId, offer);
 
     _answerCandidatesSubscription =
-        _videoCallRepo.answerCandidatesStream(appointmentId).listen((snapshot) {
+        _videoCallRepo.answerCandidatesStream(appointmentId, callId).listen((snapshot) {
       for (final change in snapshot.docChanges) {
         if (change.type == DocumentChangeType.added) {
           final data = change.doc.data()!;
@@ -139,14 +186,14 @@ class VideoCallController extends GetxController {
     });
   }
 
-  Future<void> _joinAsCallee(String appointmentId) async {
+  Future<void> _joinAsCallee(String appointmentId, String callId) async {
     callStatusText.value = 'Joining call...';
 
     _peerConnection!.onIceCandidate = (candidate) {
-      _videoCallRepo.addAnswerCandidate(appointmentId, candidate);
+      _videoCallRepo.addAnswerCandidate(appointmentId, callId, candidate);
     };
 
-    final offer = await _videoCallRepo.waitForOffer(appointmentId);
+    final offer = await _videoCallRepo.waitForOffer(appointmentId, callId);
 
     await _peerConnection!.setRemoteDescription(
       RTCSessionDescription(offer['sdp'], offer['type']),
@@ -155,10 +202,10 @@ class VideoCallController extends GetxController {
 
     final answer = await _peerConnection!.createAnswer();
     await _peerConnection!.setLocalDescription(answer);
-    await _videoCallRepo.sendAnswer(appointmentId, answer);
+    await _videoCallRepo.sendAnswer(appointmentId, callId, answer);
 
     _offerCandidatesSubscription =
-        _videoCallRepo.offerCandidatesStream(appointmentId).listen((snapshot) {
+        _videoCallRepo.offerCandidatesStream(appointmentId, callId).listen((snapshot) {
       for (final change in snapshot.docChanges) {
         if (change.type == DocumentChangeType.added) {
           final data = change.doc.data()!;
@@ -187,15 +234,36 @@ class VideoCallController extends GetxController {
   }
 
   Future<void> endCall(BuildContext context) async {
-    if (_appointmentId != null) {
-      await _videoCallRepo.endCall(_appointmentId!);
+    // Set before the Firestore write so this device's own session listener
+    // (which will see the status:'ended' it's about to write) doesn't also
+    // treat it as a remote-initiated end.
+    _callEndHandled = true;
+    if (_appointmentId != null && _callId != null) {
+      await _videoCallRepo.endCall(_appointmentId!, _callId!);
     }
     await _cleanupMediaAndConnection();
     if (context.mounted) context.go(AppRoutes.appointment);
   }
 
+  /// The other participant ended the call (or the connection dropped) — mirror
+  /// of [endCall] but triggered remotely, so there's no local BuildContext;
+  /// navigation goes through the app's global navigator key instead.
+  Future<void> _handleCallEndedRemotely(String message) async {
+    if (_callEndHandled) return;
+    _callEndHandled = true;
+
+    ToastServices.warning('Call Ended', message);
+    callStatusText.value = 'Disconnected';
+    await _cleanupMediaAndConnection();
+
+    final context = LocalStorageKeyStrings.appNavKey.currentContext;
+    if (context != null && context.mounted) {
+      context.go(AppRoutes.appointment);
+    }
+  }
+
   Future<void> _cleanupMediaAndConnection() async {
-    await _roomSubscription?.cancel();
+    await _sessionSubscription?.cancel();
     await _offerCandidatesSubscription?.cancel();
     await _answerCandidatesSubscription?.cancel();
 
